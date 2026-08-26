@@ -1,0 +1,8 @@
+.env
+.env.production
+.venv/
+__pycache__/
+*.py[cod]
+.pgdata/
+*.db
+*.log

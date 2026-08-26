@@ -1,0 +1,62 @@
+name: autoweb
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-autoweb}
+      POSTGRES_USER: ${POSTGRES_USER:-autoweb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-autoweb-dev}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - autoweb_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-autoweb} -d ${POSTGRES_DB:-autoweb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  autoweb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: autoweb:${AUTOWEB_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-autoweb}:${POSTGRES_PASSWORD:-autoweb-dev}@postgres:5432/${POSTGRES_DB:-autoweb}
+      COTELINK_SECRET: ${COTELINK_SECRET:-autoweb-dev-change-me}
+      AUTOWEB_PUBLIC_URL: ${AUTOWEB_PUBLIC_URL:-http://127.0.0.1:3000}
+      TZ: ${TZ:-America/Santiago}
+      AUTOWEB_EDGE_FALLBACK: chrome
+      CHROME_BIN: /usr/bin/chromium
+    ports:
+      - "${AUTOWEB_PORT:-5000}:5000"
+    shm_size: "1gb"
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:5000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  autoweb_postgres_data:
+    name: autoweb_postgres_data

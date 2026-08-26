@@ -1,0 +1,16 @@
+.git
+.gitignore
+.pgdata
+__pycache__
+*.py[cod]
+*.db
+*.log
+.env
+.env.*
+!.env.example
+!.env.production.example
+.venv
+venv
+tests
+dist
+build
