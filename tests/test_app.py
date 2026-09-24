@@ -113,6 +113,9 @@ class AutowebTestCase(unittest.TestCase):
         self.assertEqual(created.status_code, 201)
         self.assertEqual(self.client.post("/api/keywords", json={"phrase": "energía solar"}).status_code, 409)
         item = next(x for x in self.client.get("/api/keywords").get_json()["items"] if x["phrase"] == "energía solar")
+        self.assertEqual(item["historical_count"], 0)
+        self.assertEqual(item["new_count"], 0)
+        self.assertIsNone(item["last_detected_at"])
         self.assertEqual(self.client.put(f"/api/keywords/{item['id']}", json={"phrase": "energía solar", "active": False}).status_code, 200)
         self.assertEqual(self.client.delete(f"/api/keywords/{item['id']}").status_code, 200)
 
@@ -126,6 +129,30 @@ class AutowebTestCase(unittest.TestCase):
         self.assertEqual(self.login("ana@example.com", "secreto1").status_code, 200)
         self.assertEqual(self.client.get("/api/runs").status_code, 200)
         self.assertEqual(self.client.get("/api/keywords").status_code, 403)
+
+    def test_administration_permission_grants_full_administration_access(self):
+        self.login()
+        role = {
+            "name": "Gestor de usuarios",
+            "description": "Administra usuarios y perfiles",
+            "permissions": {"dashboard": True, "administration": True},
+        }
+        self.assertEqual(self.client.post("/api/roles", json=role).status_code, 201)
+        user = {
+            "name": "Gestora Prueba",
+            "email": "gestora@example.com",
+            "password": "secreto1",
+            "role": "Gestor de usuarios",
+        }
+        self.assertEqual(self.client.post("/api/users", json=user).status_code, 201)
+        self.client.post("/api/logout")
+        self.assertEqual(self.login("gestora@example.com", "secreto1").status_code, 200)
+
+        users_response = self.client.get("/api/users")
+        self.assertEqual(users_response.status_code, 200)
+        self.assertIn("admin@cotelink.cl", [item["email"] for item in users_response.get_json()["items"]])
+        self.assertEqual(self.client.get("/api/roles").status_code, 200)
+        self.assertEqual(self.client.get("/api/audit-events").status_code, 200)
 
     def test_ai_api_permission_can_be_assigned_to_role(self):
         self.login()
@@ -187,10 +214,7 @@ class AutowebTestCase(unittest.TestCase):
         self.assertIn("2 nuevos registros", digest["Subject"])
         self.assertIn("Hallazgo uno", digest_html)
         self.assertIn("Hallazgo dos", digest_html)
-        attachments = list(digest.iter_attachments())
-        self.assertEqual(len(attachments), 1)
-        self.assertEqual(attachments[0].get_content_type(), "application/pdf")
-        self.assertTrue(attachments[0].get_payload(decode=True).startswith(b"%PDF-"))
+        self.assertEqual(list(digest.iter_attachments()), [])
         with patch.object(autoweb, "send_mail") as sender:
             self.assertEqual(self.client.post("/api/mail-relay/test").status_code, 200)
             sender.assert_called_once()

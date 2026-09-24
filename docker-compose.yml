@@ -35,6 +35,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-autoweb}:${POSTGRES_PASSWORD:-autoweb-dev}@postgres:5432/${POSTGRES_DB:-autoweb}
       COTELINK_SECRET: ${COTELINK_SECRET:-autoweb-dev-change-me}
       AUTOWEB_PUBLIC_URL: ${AUTOWEB_PUBLIC_URL:-http://127.0.0.1:3000}
+      AUTOWEB_ALLOWED_SEARCH_HOSTS: ${AUTOWEB_ALLOWED_SEARCH_HOSTS:-news.google.com,www.google.com,consent.google.com,www.bing.com,duckduckgo.com}
       TZ: ${TZ:-America/Santiago}
       AUTOWEB_EDGE_FALLBACK: chrome
       CHROME_BIN: /usr/bin/chromium

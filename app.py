@@ -21,7 +21,7 @@ from datetime import datetime, time as clock_time, timedelta, timezone
 from functools import wraps
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
-from flask import Flask, g, jsonify, request, session
+from flask import Flask, g, jsonify, request, send_file, session
 import psycopg
 from psycopg.rows import dict_row
 
@@ -40,9 +40,16 @@ def disable_frontend_cache(response):
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://cotelink:cotelink@127.0.0.1:5432/cotelink")
 scan_lock = threading.Lock()
 PROVIDER_HOSTS = frozenset({'api.openai.com','api.anthropic.com','generativelanguage.googleapis.com'})
+DEFAULT_SEARCH_HOSTS = (
+    'news.google.com',
+    'www.google.com',
+    'consent.google.com',
+    'www.bing.com',
+    'duckduckgo.com',
+)
 SEARCH_HOSTS = frozenset(
     host.strip().lower().rstrip('.')
-    for host in os.environ.get('AUTOWEB_ALLOWED_SEARCH_HOSTS','news.google.com,www.bing.com,duckduckgo.com').split(',')
+    for host in os.environ.get('AUTOWEB_ALLOWED_SEARCH_HOSTS',','.join(DEFAULT_SEARCH_HOSTS)).split(',')
     if host.strip()
 )
 
@@ -116,6 +123,10 @@ def init_db():
         c.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS publication_max_age_days INTEGER NOT NULL DEFAULT 7")
         c.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS event_type TEXT NOT NULL DEFAULT 'monitoring'")
         c.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_source TEXT NOT NULL DEFAULT 'manual'")
+        c.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS progress_current INTEGER NOT NULL DEFAULT 0")
+        c.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS progress_total INTEGER NOT NULL DEFAULT 0")
+        c.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS progress_stage TEXT NOT NULL DEFAULT ''")
+        c.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ")
         c.execute("ALTER TABLE mail_relay ADD COLUMN IF NOT EXISTS admin_email TEXT DEFAULT ''")
         c.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS canonical_url TEXT DEFAULT ''")
         c.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS title_key TEXT DEFAULT ''")
@@ -170,7 +181,7 @@ def admin_only(fn):
     @wraps(fn)
     @auth
     def wrapped(*args, **kwargs):
-        if session['user'].get('role') != 'Administrador':
+        if not session['user'].get('permissions',{}).get('administration'):
             return jsonify(error="No tienes permisos para administrar"), 403
         return fn(*args, **kwargs)
     return wrapped
@@ -323,7 +334,7 @@ def validate_outbound_url(value, allowed_hosts, resolve=True):
     if parsed.scheme.lower()!='https' or not host or parsed.username or parsed.password or port not in (None,443):
         raise ValueError("Solo se permiten URLs HTTPS sin credenciales y en el puerto 443")
     if host not in allowed_hosts:
-        raise ValueError("El destino no pertenece a la lista de hosts permitidos")
+        raise ValueError(f"El destino {host or 'desconocido'} no pertenece a la lista de hosts permitidos")
     if resolve:
         try: addresses={item[4][0] for item in socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)}
         except socket.gaierror as exc: raise ValueError("No se pudo resolver el host configurado") from exc
@@ -442,7 +453,7 @@ def dashboard():
 @app.get("/api/runs")
 @permission_required('logs')
 def monitoring_runs():
-    return jsonify(items=rows("SELECT id,started_at,finished_at,status,total,new_count,message,event_type,run_source FROM runs ORDER BY id DESC LIMIT 200"))
+    return jsonify(items=rows("SELECT id,started_at,finished_at,status,total,new_count,message,event_type,run_source,progress_current,progress_total,progress_stage,heartbeat_at FROM runs ORDER BY id DESC LIMIT 200"))
 
 
 @app.get("/api/audit-events")
@@ -468,7 +479,17 @@ def audit_events():
 @app.route("/api/keywords", methods=["GET","POST"])
 @permission_required('keywords')
 def keywords():
-    if request.method=='GET': return jsonify(items=rows("SELECT * FROM keywords ORDER BY id DESC"))
+    if request.method=='GET':
+        return jsonify(items=rows("""
+            SELECT k.id,k.phrase,k.active,k.created_at,
+                   COUNT(a.id)::INTEGER AS historical_count,
+                   COUNT(a.id) FILTER (WHERE a.is_new=TRUE)::INTEGER AS new_count,
+                   MAX(a.found_at) AS last_detected_at
+            FROM keywords k
+            LEFT JOIN articles a ON a.keyword=k.phrase
+            GROUP BY k.id
+            ORDER BY k.id DESC
+        """))
     phrase=(request.json or {}).get('phrase','').strip()
     if len(phrase)<2: return jsonify(error="Ingresa una palabra o frase válida"),400
     try:
@@ -485,6 +506,36 @@ def keyword_item(item_id):
         else:
             d=request.json or {}; c.execute("UPDATE keywords SET phrase=%s,active=%s WHERE id=%s",(d.get('phrase','').strip(),bool(d.get('active',True)),item_id))
     return jsonify(ok=True)
+
+
+@app.get("/api/keywords/<int:item_id>/export")
+@permission_required('keywords')
+def export_keyword_articles(item_id):
+    scope=str(request.args.get('scope') or 'historical').lower()
+    if scope not in ('historical','new'): return jsonify(error="Tipo de exportación no válido"),400
+    with db() as c:
+        keyword=c.execute("SELECT phrase FROM keywords WHERE id=%s",(item_id,)).fetchone()
+        if not keyword: return jsonify(error="Palabra clave no encontrada"),404
+        condition=" AND is_new=TRUE" if scope=='new' else ''
+        articles=c.execute("SELECT keyword,url,summary,found_at FROM articles WHERE keyword=%s"+condition+" ORDER BY found_at DESC",(keyword['phrase'],)).fetchall()
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    workbook=Workbook(); sheet=workbook.active; sheet.title='Noticias'
+    sheet.append(['Palabra clave','Link','Resumen de la noticia','Fecha y hora de detección'])
+    for cell in sheet[1]: cell.font=Font(bold=True,color='FFFFFF'); cell.fill=PatternFill('solid',fgColor='174D49')
+    def excel_text(value):
+        text=str(value or '')
+        return "'"+text if text.startswith(('=','+','-','@')) else text
+    for article in articles:
+        detected=article['found_at'].astimezone().strftime('%d-%m-%Y %H:%M:%S') if article['found_at'] else ''
+        sheet.append([excel_text(article['keyword']),article['url'],excel_text(article['summary']),detected])
+        link_cell=sheet.cell(sheet.max_row,2); link_cell.hyperlink=article['url']; link_cell.style='Hyperlink'
+    sheet.freeze_panes='A2'; sheet.auto_filter.ref=sheet.dimensions
+    for column,width in {'A':28,'B':65,'C':90,'D':25}.items(): sheet.column_dimensions[column].width=width
+    output=io.BytesIO(); workbook.save(output); output.seek(0)
+    safe_name=re.sub(r'[^a-zA-Z0-9_-]+','_',keyword['phrase']).strip('_') or 'palabra_clave'
+    suffix='nuevas' if scope=='new' else 'historicas'
+    return send_file(output,as_attachment=True,download_name=f'{safe_name}_{suffix}.xlsx',mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
 @app.delete("/api/articles")
@@ -826,7 +877,7 @@ def build_news_report_pdf(articles, generated_at=None):
     return output.getvalue()
 
 
-def digest_notification_message(relay,user,articles,report_pdf=None):
+def digest_notification_message(relay,user,articles):
     """Build one message containing every new article found in a scan."""
     count=len(articles); plain_items=[]; html_items=[]
     for article in articles:
@@ -839,8 +890,6 @@ def digest_notification_message(relay,user,articles,report_pdf=None):
     if relay.get('admin_email') and relay['admin_email'].lower()!=user['email'].lower(): message['Bcc']=relay['admin_email']
     message.set_content(f"Hola {user['name']},\n\nEl sistema de seguimiento web detectó {count} {label}.\n\n"+'\n\n'.join(plain_items)+"\n\nAutoweb")
     message.add_alternative(f"""<!doctype html><html><body style="margin:0;background:#f3f6f4;font-family:Arial,sans-serif;color:#18302e"><div style="max-width:680px;margin:30px auto;background:white;border-radius:16px;overflow:hidden;border:1px solid #dfe8e4"><div style="background:#174d49;color:white;padding:28px 34px"><div style="font-size:22px;font-weight:bold">Autoweb</div><div style="color:#dcff7e;margin-top:6px">INTELIGENCIA QUE ANTICIPA</div></div><div style="padding:34px"><h1 style="font-size:25px;margin:0 0 14px">Hola {html.escape(user['name'])},</h1><p style="font-size:16px;line-height:1.6;color:#526562">El sistema de seguimiento web ha detectado <b>{count} {label}</b> relacionados con tus parámetros de monitoreo.</p>{''.join(html_items)}<p style="font-size:12px;color:#899693">Este mensaje fue enviado automáticamente por Autoweb.</p></div></div></body></html>""",subtype='html')
-    pdf=report_pdf if report_pdf is not None else build_news_report_pdf(articles)
-    message.add_attachment(pdf,maintype='application',subtype='pdf',filename=f"reporte_autoweb_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf")
     return message
 
 
@@ -853,13 +902,11 @@ def notify_new_articles(articles):
     sent=0; errors=[]
     if not relay['smtp_host'] or not relay['sender_email']:
         return 0,"Relay habilitado sin servidor SMTP o remitente"
-    try: report_pdf=build_news_report_pdf(articles)
-    except Exception as exc: return 0,f"No se pudo generar el PDF del reporte: {exc}"
     for user in users:
         try:
             # Aísla cada destinatario para que un rechazo no bloquee los siguientes.
             with smtp_connection(relay) as server:
-                refused=server.send_message(digest_notification_message(relay,user,articles,report_pdf)) or {}
+                refused=server.send_message(digest_notification_message(relay,user,articles)) or {}
             if user['email'] in refused:
                 errors.append(f"{user['email']}: destinatario rechazado por SMTP")
             else: sent+=1
@@ -868,7 +915,7 @@ def notify_new_articles(articles):
     return sent,('; '.join(errors)[:500] if errors else None)
 
 
-def browser_results(engine, phrases, inspect_publication=False):
+def browser_results(engine, phrases, inspect_publication=False, progress_callback=None):
     """Navigate a search engine with a headless browser and collect result links."""
     try:
         from selenium import webdriver
@@ -892,32 +939,25 @@ def browser_results(engine, phrases, inspect_publication=False):
             if not marker: raise ValueError("La URL del motor no contiene el marcador {query}")
             search_url=validate_outbound_url(prefix+urllib.parse.quote_plus(keyword_search_query(phrase))+suffix,SEARCH_HOSTS)
             is_feed='rss' in search_url.lower() or 'format=rss' in search_url.lower()
-            driver.get(search_url)
-            validate_outbound_url(driver.current_url,SEARCH_HOSTS)
-            selector='li.b_algo h2 a' if 'bing.' in engine['search_url'].lower() else 'a:has(h3)'
-            if not is_feed:
-                try: WebDriverWait(driver,10).until(lambda d: d.find_elements(By.CSS_SELECTOR,'item') or d.find_elements(By.CSS_SELECTOR,selector))
-                except Exception: pass
-            raw=driver.execute_script("""
-                const selector=arguments[0];
-                const feed=[...document.querySelectorAll('item')].map(item=>({
-                    href:(item.querySelector('link')?.textContent||item.querySelector('link')?.nextSibling?.textContent||'').trim(),
-                    title:(item.querySelector('title')?.textContent||'').trim(),
-                    published_at:(item.querySelector('pubDate')?.textContent||'').trim(),
-                    summary:(item.querySelector('description')?.textContent||'').trim()
-                }));
-                if(feed.length) return feed;
-                let nodes=[...document.querySelectorAll(selector)];
-                if(!nodes.length) nodes=[...document.querySelectorAll('a[href]')];
-                return nodes.map(a=>{const box=a.closest('article,li,.b_algo,.g')||a.parentElement;const title=(a.innerText||a.textContent||'').trim().split('\\n')[0];const text=(box?.innerText||'').trim();return {href:a.href,title,summary:text.startsWith(title)?text.slice(title.length).trim():text}});
-            """,selector)
             if is_feed:
                 try:
                     with safe_urlopen(search_url,headers={'User-Agent':'Mozilla/5.0 CoteLink/1.0'},timeout=30,allowed_hosts=SEARCH_HOSTS) as response:
                         root=ET.fromstring(response.read())
                     raw=[{'href':node.findtext('link',''),'title':node.findtext('title',''),'published_at':node.findtext('pubDate',''),'summary':search_result_summary(node.findtext('description',''))} for node in root.findall('.//item')]
                 except Exception as feed_error:
-                    raise RuntimeError(f"{engine['name']}: el browser abrió la búsqueda, pero no se pudo leer el feed: {feed_error}") from feed_error
+                    raise RuntimeError(f"{engine['name']}: no se pudo leer el feed: {feed_error}") from feed_error
+            else:
+                driver.get(search_url)
+                validate_outbound_url(driver.current_url,SEARCH_HOSTS)
+                selector='li.b_algo h2 a' if 'bing.' in engine['search_url'].lower() else 'a:has(h3)'
+                try: WebDriverWait(driver,10).until(lambda d: d.find_elements(By.CSS_SELECTOR,selector))
+                except Exception: pass
+                raw=driver.execute_script("""
+                    const selector=arguments[0];
+                    let nodes=[...document.querySelectorAll(selector)];
+                    if(!nodes.length) nodes=[...document.querySelectorAll('a[href]')];
+                    return nodes.map(a=>{const box=a.closest('article,li,.b_algo,.g')||a.parentElement;const title=(a.innerText||a.textContent||'').trim().split('\\n')[0];const text=(box?.innerText||'').trim();return {href:a.href,title,summary:text.startsWith(title)?text.slice(title.length).trim():text}});
+                """,selector)
             seen=set()
             for item in raw:
                 href=item.get('href',''); title=item.get('title','')
@@ -929,8 +969,9 @@ def browser_results(engine, phrases, inspect_publication=False):
                 if not is_feed and any(x in parsed.netloc.lower() for x in ('google.com','bing.com')): continue
                 seen.add(href); collected[phrase].append({'title':title[:500],'url':href,'source':engine['name'],'published_at':item.get('published_at',''),'summary':search_result_summary(item.get('summary',''))})
                 if len(collected[phrase])>=10: break
+            if progress_callback: progress_callback(phrase,1,f"{engine['name']}: resultados obtenidos para {phrase}")
             if inspect_publication:
-                for article in collected[phrase]:
+                for article_index,article in enumerate(collected[phrase],start=2):
                     try:
                         driver.get(article['url'])
                         metadata=driver.execute_script("""
@@ -967,6 +1008,9 @@ def browser_results(engine, phrases, inspect_publication=False):
                     except Exception:
                         article['published_at']=datetime.now(timezone.utc).isoformat()
                         article['publication_date_source']='discovered_at'
+                    finally:
+                        if progress_callback: progress_callback(phrase,article_index,f"{engine['name']}: revisando noticias de {phrase}")
+            if progress_callback: progress_callback(phrase,11,f"{engine['name']}: {phrase} completada")
     except Exception as exc:
         raise RuntimeError(f"{engine['name']}: no fue posible automatizar {engine['browser']}: {exc}") from exc
     finally:
@@ -992,15 +1036,24 @@ def run_scan(run_source='manual'):
         if browser_mode:
             engines=rows("SELECT * FROM browser_engines WHERE active=TRUE ORDER BY id")
             if not engines: raise RuntimeError("La búsqueda por browsers está habilitada, pero no hay motores activos")
-            for engine in engines:
-                # La visita a cada noticia también obtiene resumen e imagen para el PDF;
+            progress_total=max(1,len(engines)*len(kws)*11)
+            phrase_positions={k['phrase']:index for index,k in enumerate(kws)}
+            with db() as c: c.execute("UPDATE runs SET progress_total=%s,progress_stage=%s,heartbeat_at=%s WHERE id=%s",(progress_total,'Preparando navegadores',datetime.now(timezone.utc),run_id))
+            for engine_index,engine in enumerate(engines):
+                # La visita a cada noticia obtiene fecha y contexto adicional;
                 # no debe depender de que el filtro opcional por fecha esté activado.
-                results=browser_results(engine,[k['phrase'] for k in kws],True)
+                def report_progress(phrase,step,stage,engine_offset=engine_index*len(kws)*11):
+                    current=engine_offset+phrase_positions.get(phrase,0)*11+step
+                    with db() as c: c.execute("UPDATE runs SET progress_current=%s,progress_stage=%s,heartbeat_at=%s WHERE id=%s",(min(current,progress_total),stage[:300],datetime.now(timezone.utc),run_id))
+                results=browser_results(engine,[k['phrase'] for k in kws],True,report_progress)
                 engine_stats.append(f"{engine['name']}: {sum(len(x) for x in results.values())}")
                 for phrase,items in results.items(): browser_found[phrase].extend(items)
             if not any(browser_found.values()):
                 raise RuntimeError("Los browsers no devolvieron resultados. "+'; '.join(engine_stats))
-        for k in kws:
+        else:
+            progress_total=max(1,len(kws))
+            with db() as c: c.execute("UPDATE runs SET progress_total=%s,progress_stage=%s,heartbeat_at=%s WHERE id=%s",(progress_total,'Preparando consultas',datetime.now(timezone.utc),run_id))
+        for keyword_index,k in enumerate(kws,start=1):
             found=browser_found[k['phrase']] if browser_mode else (provider_articles(configured[0],k['phrase']) if configured else demo_articles(k['phrase']))
             for a in found:
                 if not article_matches_keyword(a,k['phrase']): continue
@@ -1021,6 +1074,8 @@ def run_scan(run_source='manual'):
                         if should_alert:
                             new_count+=1
                             new_articles.append({'url':a['url'],'title':a['title'],'source':source,'keyword':k['phrase'],'summary':summary,'image_url':image_url,'published_at':stored_published})
+            if not browser_mode:
+                with db() as c: c.execute("UPDATE runs SET progress_current=%s,progress_stage=%s,heartbeat_at=%s WHERE id=%s",(keyword_index,f"Tema completado: {k['phrase']}"[:300],datetime.now(timezone.utc),run_id))
         mails_sent,mail_error=notify_new_articles(new_articles)
         finish=datetime.now(timezone.utc)
         frequency=setting['frequency']
@@ -1029,13 +1084,14 @@ def run_scan(run_source='manual'):
             mode='browsers' if browser_mode else ('IA' if configured else 'demostración')
             detail=(' · '+'; '.join(engine_stats)) if browser_mode else ''
             mail_detail=(f' · {mails_sent} correos enviados' if mails_sent else '')+(f' · errores de correo: {mail_error}' if mail_error else '')
-            c.execute("UPDATE runs SET finished_at=%s,status='success',total=%s,new_count=%s,message=%s WHERE id=%s",(finish,total,new_count,f'Monitoreo completado mediante {mode}{detail}{mail_detail}',run_id))
+            c.execute("UPDATE runs SET finished_at=%s,status='success',total=%s,new_count=%s,message=%s,progress_current=progress_total,progress_stage='Completado',heartbeat_at=%s WHERE id=%s",(finish,total,new_count,f'Monitoreo completado mediante {mode}{detail}{mail_detail}',finish,run_id))
             c.execute("UPDATE settings SET last_run=%s,next_run=%s WHERE id=1",(finish,next_run))
             if new_count: c.execute("INSERT INTO alerts(type,title,message,created_at) VALUES('news','Nuevas noticias',%s,%s)",(f'Se encontraron {new_count} enlaces nuevos.',finish))
             if mail_error: c.execute("INSERT INTO alerts(type,title,message,created_at) VALUES('error','Error en relay de correo',%s,%s)",(mail_error,finish))
     except Exception as e:
         with db() as c:
-            c.execute("UPDATE runs SET finished_at=%s,status='error',message=%s WHERE id=%s",(datetime.now(timezone.utc),str(e),run_id))
+            failed_at=datetime.now(timezone.utc)
+            c.execute("UPDATE runs SET finished_at=%s,status='error',message=%s,progress_stage='Error',heartbeat_at=%s WHERE id=%s",(failed_at,str(e),failed_at,run_id))
             c.execute("INSERT INTO alerts(type,title,message,created_at) VALUES('error','Error en el monitoreo',%s,%s)",(str(e),datetime.now(timezone.utc)))
 
 
