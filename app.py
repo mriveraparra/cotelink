@@ -444,7 +444,7 @@ def dashboard():
         new=c.execute("SELECT COUNT(*) AS count FROM articles WHERE is_new=TRUE").fetchone()['count']
         active=c.execute("SELECT COUNT(*) AS count FROM keywords WHERE active=TRUE").fetchone()['count']
         setting=c.execute("SELECT *,to_char(hour,'HH24:MI') AS hour FROM settings WHERE id=1").fetchone()
-        recent=c.execute("SELECT * FROM articles ORDER BY found_at DESC LIMIT 8").fetchall()
+        recent=c.execute("SELECT id,url,title,source,keyword,found_at,is_new FROM articles WHERE is_new=TRUE ORDER BY found_at DESC").fetchall()
         runs=c.execute("SELECT * FROM runs WHERE event_type='monitoring' ORDER BY id DESC LIMIT 7").fetchall()
         alerts=c.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 8").fetchall()
     return jsonify(total=total,new=new,active=active,setting=setting,recent=recent,runs=runs,alerts=alerts)
