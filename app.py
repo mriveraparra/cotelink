@@ -67,6 +67,7 @@ AUDIT_ACTIONS={
     'browser_engines':'Creación de motor','browser_engine_item':'Gestión de motor',
     'roles':'Creación de perfil','role_item':'Gestión de perfil','users':'Creación de usuario',
     'user_item':'Gestión de usuario','scan':'Ejecución manual del monitoreo','read_alerts':'Lectura de alertas',
+    'send_articles_mail':'Envío manual de noticias por correo',
 }
 
 
@@ -557,6 +558,33 @@ def articles_list():
     return jsonify(items=rows("SELECT * FROM articles ORDER BY found_at DESC LIMIT 500"))
 
 
+@app.post("/api/articles/send-mail")
+@permission_required('news')
+def send_articles_mail():
+    articles=rows("""
+        SELECT url,title,source,keyword,summary,image_url,published_at
+        FROM articles
+        WHERE is_new=TRUE
+        ORDER BY found_at DESC
+    """)
+    if not articles:
+        return jsonify(error="No hay noticias nuevas para enviar"),400
+    mail_started=datetime.now(timezone.utc)
+    sent,error=notify_new_articles(articles)
+    record_mail_run('manual',len(articles),sent,error,mail_started)
+    now=datetime.now(timezone.utc)
+    if not sent:
+        detail=error or "El servidor SMTP no aceptó ningún correo"
+        with db() as c:
+            c.execute("INSERT INTO alerts(type,title,message,created_at) VALUES('error','Error en envío manual de noticias',%s,%s)",(detail,now))
+        return jsonify(error=detail),502
+    message=f"Se enviaron {len(articles)} noticias a {sent} usuario{'s' if sent!=1 else ''}"
+    if error: message+=f". Algunos envíos fallaron: {error}"
+    with db() as c:
+        c.execute("INSERT INTO alerts(type,title,message,created_at) VALUES(%s,'Envío manual de noticias',%s,%s)",('error' if error else 'news',message,now))
+    return jsonify(ok=not bool(error),sent=sent,articles=len(articles),warning=error,message=message)
+
+
 @app.route("/api/settings", methods=["GET","PUT"])
 @permission_required('apis')
 def settings():
@@ -915,6 +943,26 @@ def notify_new_articles(articles):
     return sent,('; '.join(errors)[:500] if errors else None)
 
 
+def record_mail_run(run_source,article_count,sent,error,started_at=None):
+    """Add a visible delivery result to the monitoring log."""
+    if not article_count: return
+    started_at=started_at or datetime.now(timezone.utc)
+    finished_at=datetime.now(timezone.utc)
+    status='success' if sent and not error else 'error'
+    source='automático' if run_source=='automatic' else 'manual'
+    if status=='success':
+        message=f'Envío {source} exitoso: {article_count} noticias enviadas a {sent} destinatarios'
+    elif sent:
+        message=f'Envío {source} parcial: {article_count} noticias enviadas a {sent} destinatarios · {error}'
+    else:
+        message=f'Envío {source} no exitoso: {error or "el SMTP no aceptó destinatarios"}'
+    with db() as c:
+        c.execute("""
+            INSERT INTO runs(started_at,finished_at,status,total,new_count,message,event_type,run_source,progress_current,progress_total,progress_stage,heartbeat_at)
+            VALUES(%s,%s,%s,%s,%s,%s,'mail',%s,%s,%s,%s,%s)
+        """,(started_at,finished_at,status,article_count,sent,message[:500],run_source,article_count,article_count,'Correo enviado' if status=='success' else 'Error de correo',finished_at))
+
+
 def browser_results(engine, phrases, inspect_publication=False, progress_callback=None):
     """Navigate a search engine with a headless browser and collect result links."""
     try:
@@ -1076,7 +1124,9 @@ def run_scan(run_source='manual'):
                             new_articles.append({'url':a['url'],'title':a['title'],'source':source,'keyword':k['phrase'],'summary':summary,'image_url':image_url,'published_at':stored_published})
             if not browser_mode:
                 with db() as c: c.execute("UPDATE runs SET progress_current=%s,progress_stage=%s,heartbeat_at=%s WHERE id=%s",(keyword_index,f"Tema completado: {k['phrase']}"[:300],datetime.now(timezone.utc),run_id))
+        mail_started=datetime.now(timezone.utc)
         mails_sent,mail_error=notify_new_articles(new_articles)
+        record_mail_run(run_source,len(new_articles),mails_sent,mail_error,mail_started)
         finish=datetime.now(timezone.utc)
         frequency=setting['frequency']
         next_run=next_scheduled_run(finish,frequency,setting['hour'])
