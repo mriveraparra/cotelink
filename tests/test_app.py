@@ -49,6 +49,19 @@ class ExactPhraseMatchingTestCase(unittest.TestCase):
         self.assertTrue(autoweb.article_matches_keyword({"title":"Texto sin relación"},"economía"))
         self.assertEqual(autoweb.keyword_search_query("economía"),"economía")
 
+    def test_browser_relevance_and_event_similarity(self):
+        article={"title":"Chile presenta una nueva plataforma de inteligencia artificial","summary":""}
+        self.assertEqual(autoweb.browser_article_relevance(article,"inteligencia artificial"),100)
+        self.assertLess(autoweb.browser_article_relevance({"title":"Noticia sin relación","summary":""},"inteligencia artificial"),70)
+        self.assertTrue(autoweb.same_news_event("Empresa X lanza nueva plataforma de IA","Empresa X presenta su nueva plataforma IA"))
+
+    def test_publication_age_filter_rejects_old_or_unknown_dates(self):
+        reference=datetime(2026,10,26,12,0,tzinfo=timezone.utc)
+        self.assertTrue(autoweb.publication_is_recent("2026-10-25T12:00:00Z",reference,{"days":7}))
+        self.assertFalse(autoweb.publication_is_recent("2026-10-01T12:00:00Z",reference,{"days":7}))
+        self.assertFalse(autoweb.publication_is_recent("2026-10-28T12:00:00Z",reference,{"days":7}))
+        self.assertFalse(autoweb.publication_is_recent("",reference,{"days":7}))
+
     def test_report_fragment_uses_excerpt_and_has_title_fallback(self):
         self.assertEqual(autoweb.report_fragment({"title":"Noticia", "summary":"Primer fragmento."}),"Primer fragmento.")
         long_excerpt="contenido relacionado "*200
@@ -180,6 +193,16 @@ class AutowebTestCase(unittest.TestCase):
         self.assertEqual(calculated.astimezone().strftime("%H:%M"), "14:45")
         self.assertEqual(self.client.put("/api/schedule", json={"frequency": "invalid", "hour": "10:00"}).status_code, 400)
 
+    def test_news_criteria_configuration_defaults_to_chile(self):
+        self.login()
+        initial=self.client.get("/api/news-criteria").get_json()["setting"]
+        self.assertEqual(initial["news_country"],"Chile")
+        self.assertEqual(initial["news_period_hours"],24)
+        response=self.client.put("/api/news-criteria",json={"news_country":"Chile","news_period_hours":48,"news_relevance_min":80,"news_criteria":"Solo noticias verificables y directamente relacionadas."})
+        self.assertEqual(response.status_code,200)
+        saved=self.client.get("/api/news-criteria").get_json()["setting"]
+        self.assertEqual(saved["news_relevance_min"],80)
+
     def test_browser_automation_configuration(self):
         self.login()
         self.assertEqual(self.client.put("/api/browser-automation", json={"enabled": True, "publication_date_filter": True, "publication_max_age_days": 14}).status_code, 200)
@@ -215,6 +238,13 @@ class AutowebTestCase(unittest.TestCase):
         self.assertIn("Hallazgo uno", digest_html)
         self.assertIn("Hallazgo dos", digest_html)
         self.assertEqual(list(digest.iter_attachments()), [])
+        self.assertIsNotNone(digest["Date"])
+        self.assertIsNotNone(digest["Message-ID"])
+        no_news = autoweb.no_news_notification_message(relay, {"name": "Ana", "email": "ana@example.com"}, {"frequency": "weekly", "hour": "14:45"})
+        no_news_html=no_news.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("Sin nuevas noticias", no_news_html)
+        self.assertIn("semanalmente a las 14:45", no_news_html)
+        self.assertEqual(list(no_news.iter_attachments()), [])
         with patch.object(autoweb, "send_mail") as sender:
             self.assertEqual(self.client.post("/api/mail-relay/test").status_code, 200)
             sender.assert_called_once()
@@ -267,8 +297,8 @@ class AutowebTestCase(unittest.TestCase):
         self.client.put("/api/browser-automation", json={"enabled": True})
         results = {
             "inteligencia artificial": [
-                {"title": "Mismo artículo", "url": "https://example.com/noticia?utm_source=google", "source": "Google", "published_at": ""},
-                {"title": "Mismo artículo", "url": "https://example.com/noticia?utm_source=bing", "source": "Bing", "published_at": ""},
+                {"title": "Inteligencia artificial: mismo artículo", "url": "https://example.com/noticia?utm_source=google", "source": "Google", "published_at": datetime.now(timezone.utc).isoformat()},
+                {"title": "Inteligencia artificial: mismo artículo", "url": "https://example.com/noticia?utm_source=bing", "source": "Bing", "published_at": datetime.now(timezone.utc).isoformat()},
             ]
         }
         with autoweb.db() as connection:
@@ -282,22 +312,41 @@ class AutowebTestCase(unittest.TestCase):
         self.assertEqual(run["run_source"], "automatic")
         self.assertEqual(run["new_count"], 1)
 
-    def test_old_article_is_stored_without_alert_when_date_filter_is_enabled(self):
+    def test_scan_deduplicates_same_event_with_different_url_and_headline(self):
+        self.login()
+        self.client.put("/api/browser-automation", json={"enabled": True})
+        now = datetime.now(timezone.utc).isoformat()
+        results = {
+            "inteligencia artificial": [
+                {"title": "Empresa X lanza nueva plataforma de inteligencia artificial", "url": "https://source-a.example/noticia", "source": "Fuente A", "published_at": now},
+                {"title": "Empresa X presenta su nueva plataforma de inteligencia artificial", "url": "https://source-b.example/otra-noticia", "source": "Fuente B", "published_at": now},
+            ]
+        }
+        with autoweb.db() as connection:
+            connection.execute("UPDATE keywords SET active=FALSE")
+            connection.execute("INSERT INTO keywords(phrase,active,created_at) VALUES('inteligencia artificial',TRUE,%s) ON CONFLICT(phrase) DO UPDATE SET active=TRUE", (datetime.now(timezone.utc),))
+        with patch.object(autoweb, "browser_results", return_value=results), patch.object(autoweb, "notify_new_articles", return_value=(0, None)) as notifier:
+            self.assertTrue(autoweb.run_scan_guarded("manual"))
+        with autoweb.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) AS count FROM articles").fetchone()["count"], 1)
+        self.assertEqual(len(notifier.call_args.args[0]), 1)
+
+    def test_old_article_is_discarded_when_date_filter_is_enabled(self):
         self.login()
         self.client.put("/api/browser-automation", json={"enabled": True, "publication_date_filter": True, "publication_max_age_days": 30})
-        results={"inteligencia artificial":[{"title":"La ruta de alta velocidad del Shinkansen de Leo Soto","url":"https://www.df.cl/df-mas/punto-de-partida/la-ruta-de-alta-velocidad-del-shinkansen-de-leo-soto","source":"Google","published_at":"2024-07-06T04:00:00-04:00"}]}
+        results={"inteligencia artificial":[{"title":"Inteligencia artificial: una noticia antigua","url":"https://www.df.cl/df-mas/punto-de-partida/la-ruta-de-alta-velocidad-del-shinkansen-de-leo-soto","source":"Google","published_at":"2024-07-06T04:00:00-04:00"}]}
         with autoweb.db() as connection:
             connection.execute("UPDATE keywords SET active=FALSE")
             connection.execute("INSERT INTO keywords(phrase,active,created_at) VALUES('inteligencia artificial',TRUE,%s) ON CONFLICT(phrase) DO UPDATE SET active=TRUE",(datetime.now(timezone.utc),))
-        with patch.object(autoweb,"browser_results",return_value=results), patch.object(autoweb,"notify_new_articles",return_value=(0,None)) as notifier:
+        with patch.object(autoweb,"browser_results",return_value=results), patch.object(autoweb,"notify_no_new_articles",return_value=(1,None)) as notifier:
             self.assertTrue(autoweb.run_scan_guarded("automatic"))
         with autoweb.db() as connection:
             article=connection.execute("SELECT * FROM articles WHERE url=%s",(results['inteligencia artificial'][0]['url'],)).fetchone()
             run=connection.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
-        self.assertIsNotNone(article["discovered_at"])
-        self.assertFalse(article["is_new"])
+        self.assertIsNone(article)
         self.assertEqual(run["new_count"],0)
-        notifier.assert_called_once_with([])
+        notifier.assert_called_once()
+        self.assertEqual(notifier.call_args.args[0]["frequency"], "daily")
 
     def test_publication_metadata_precedence_and_visible_spanish_date(self):
         discovered=datetime(2026,9,9,13,0,tzinfo=timezone.utc)

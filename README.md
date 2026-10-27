@@ -117,7 +117,7 @@ Antes de guardar un hallazgo se comprueba:
 2. URL canónica sin fragmentos ni parámetros de seguimiento como `utm_*`, `fbclid`, `gclid` o `msclkid`.
 3. Título normalizado sin diferencias de mayúsculas, acentos o espacios.
 
-Un registro existente no se inserta nuevamente, no incrementa el contador de noticias nuevas y no genera correo.
+Un registro existente no se inserta nuevamente ni incrementa el contador de noticias nuevas. Si una ejecución automática finaliza sin noticias nuevas, se envía un correo informativo con el horario configurado; las ejecuciones manuales sin novedades no generan correo.
 
 ## Automatización y log
 

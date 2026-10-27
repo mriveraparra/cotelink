@@ -10,8 +10,32 @@
 .recent-news-scroll{max-height:330px;overflow-y:auto;margin-top:10px;padding-right:8px;scrollbar-width:thin;scrollbar-color:#b8c8c2 transparent}.recent-news-scroll .news-item:first-child{margin-top:0}.recent-news-scroll::-webkit-scrollbar{width:7px}.recent-news-scroll::-webkit-scrollbar-track{background:transparent}.recent-news-scroll::-webkit-scrollbar-thumb{background:#b8c8c2;border-radius:10px}.recent-news-scroll::-webkit-scrollbar-thumb:hover{background:#769087}
 .news-actions{display:flex;gap:9px;align-items:center}@media(max-width:620px){.section-head:has(.news-actions){gap:16px;flex-direction:column}.news-actions{width:100%;flex-direction:column}.news-actions button{width:100%}}
 .sidebar-emblem{height:72px;margin:18px 0 12px;display:grid;place-items:center;border-bottom:1px solid var(--line)}.sidebar-emblem span{position:relative;display:grid;place-items:center;width:46px;height:46px;border-radius:15px;background:var(--green);color:var(--lime);font:800 23px Manrope;box-shadow:0 8px 20px #174d4924}.sidebar-emblem span:after{content:'';position:absolute;inset:6px;border:1px solid #dcff7e66;border-radius:10px}
+
+/* Identidad azul */
+:root{--green:#174d91;--lime:#78a9ff}
+aside{background:#101a33;border-right-color:#26385f;color:#eef4ff}
+aside .brand{color:#f5f8ff}
+aside .logo{background:#78a9ff;color:#0d1a36}
+.sidebar-emblem{border-bottom-color:#26385f}
+.sidebar-emblem span{background:#173d78;color:#8db7ff;box-shadow:0 8px 22px #07112680}
+.sidebar-emblem span:after{border-color:#8db7ff66}
+aside nav>small{color:#7288b2}
+aside nav button{color:#c6d5f4}
+aside nav button:hover{background:#142548;color:#fff}
+aside nav button.active{background:#17294f;color:#fff;box-shadow:inset 3px 0 #6e9fff}
+aside nav button>b{background:#78a9ff;color:#0d1a36}
+aside .user{border-top-color:#26385f}
+aside .user i{background:#1c3564;color:#9fc1ff}
+aside .user button{color:#bcd0f4}
+.mint{background:#e5efff;color:#3975cc}.tag{background:#e8f0ff;color:#315f9f}.status,.role>span{background:#e5efff;color:#3267ad}.permission-tags span{background:#e8f0ff;color:#315f9f}.keyword-metrics .keyword-new,.keyword-metrics .keyword-count-link.keyword-new{background:#e8f0ff;color:#315f9f}.pill{background:#e8f0ff;color:#315f9f}.alert-card i{background:#e8f0ff!important;color:#315f9f!important}.alert-card.error i{background:#fde9e7!important;color:#a94442!important}
 .audit-tools{display:flex;justify-content:flex-end;margin-bottom:14px}.audit-tools label{margin:0;width:min(320px,100%)}.audit-head,.audit-row{display:grid;grid-template-columns:1.1fr 1.6fr 100px 150px;gap:14px;align-items:center}.audit-head{padding:10px 12px;color:var(--muted);font-size:9px;font-weight:700}.audit-row{padding:14px 12px;border-top:1px solid var(--line);font-size:11px}.audit-row b,.audit-row small{display:block}.audit-row small{color:var(--muted);margin-top:3px;overflow-wrap:anywhere}@media(max-width:700px){.audit-head{display:none}.audit-row{grid-template-columns:1fr auto}.audit-row>div:nth-child(2){grid-column:1/-1}.audit-row>small{justify-self:end}}
 .provider-actions{display:grid;grid-template-columns:1fr 1.25fr;gap:8px}.provider-actions button{margin-top:8px}.pending-status{background:#fff2d9!important;color:#95661f!important}.error-status{background:#fde6e3!important;color:#a9473f!important}.test-result{font-size:9px;line-height:1.4;padding:8px;border-radius:7px;margin-top:8px}.test-result.verified{background:#edf8f0;color:#347052}.test-result.failed{background:#fff0ee;color:#9b463f}button:disabled{opacity:.55;cursor:wait}
 .role-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}.role-card{border:1px solid var(--line);border-radius:10px;padding:15px}.role-card h4{margin:0;font-size:13px}.role-card h4 small{font-size:7px;background:#edf1ef;color:#72807c;padding:3px 5px;border-radius:7px}.role-card p{color:var(--muted);font-size:10px;min-height:28px}.permission-tags{display:flex;flex-wrap:wrap;gap:5px;min-height:46px}.permission-tags span{font-size:8px;background:#eef5df;color:#58702d;padding:4px 6px;border-radius:8px}.role-card>.actions{border-top:1px solid var(--line);padding-top:10px;margin-top:10px;display:flex;justify-content:flex-end}.permissions{display:grid!important;grid-template-columns:1fr 1fr;gap:0 12px!important;background:#f5f7f4;padding:5px 12px;border-radius:9px}.permissions label{display:flex;align-items:center;gap:7px;margin:9px 0}.permissions input{width:auto;margin:0}@media(max-width:900px){.role-grid{grid-template-columns:1fr}}
 .user-table-head,.user-row{display:grid;grid-template-columns:minmax(220px,1fr) 140px 100px 100px;gap:12px;align-items:center}.user-table-head{padding:20px 12px 9px;color:var(--muted);font-size:9px;font-weight:800;letter-spacing:.8px}.user-row{padding:13px 12px;border-top:1px solid var(--line);font-size:11px}.user-ident{display:flex;align-items:center;gap:10px}.user-ident i{font-style:normal;width:34px;height:34px;border-radius:50%;background:#dcefd4;display:grid;place-items:center;font-size:10px;font-weight:800}.user-ident div{display:flex;flex-direction:column}.user-ident small{color:var(--muted);margin-top:3px}.status.off{background:#f1f2f1;color:#89928f}.actions button:disabled{opacity:.35;cursor:not-allowed}.active-field{display:flex;align-items:center;gap:8px}.active-field input{width:auto;margin:0}.modal form>.user-close{position:absolute;right:18px;top:12px;border:0;background:none;font-size:24px}@media(max-width:520px){.user-table-head{display:none}.user-row{grid-template-columns:1fr auto}.user-row>span,.user-row>b{display:none}}
 .audit-tools{align-items:end;gap:12px;flex-wrap:wrap}.audit-tools label{width:auto;min-width:180px;flex:1}.audit-tools button{height:42px}
+
+/* Ajustes finales de la paleta azul */
+.login-art{background:#101a33}.login-art:after{border-color:#304b7c}.hero>b,.welcome>div>small{color:#78a9ff}.hero em{color:#78a9ff}.hero p{color:#c3d2ed}
+.bar{background:#245caa}.bar.new{background:#78a9ff}.legend{color:#245caa}.legend span{color:#78a9ff}
+.permission-tags span{background:#e8f0ff;color:#315f9f}.test-result.verified{background:#e8f0ff;color:#315f9f}.user-ident i{background:#e5efff;color:#3267ad}
+textarea{display:block;width:100%;padding:12px;margin-top:7px;border:1px solid #d9e1de;border-radius:9px;background:white;outline:none;font:inherit;resize:vertical;line-height:1.45}

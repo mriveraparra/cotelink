@@ -20,7 +20,7 @@ import unicodedata
 from datetime import datetime, time as clock_time, timedelta, timezone
 from functools import wraps
 from email.message import EmailMessage
-from email.utils import parsedate_to_datetime
+from email.utils import format_datetime, make_msgid, parsedate_to_datetime
 from flask import Flask, g, jsonify, request, send_file, session
 import psycopg
 from psycopg.rows import dict_row
@@ -53,6 +53,8 @@ SEARCH_HOSTS = frozenset(
     if host.strip()
 )
 
+DEFAULT_NEWS_CRITERIA = """Prioriza calidad sobre cantidad. Verifica la fecha real de publicación y descarta noticias fuera del período configurado. Exige relación directa con la palabra clave y una relevancia mínima de 70/100. Descarta menciones incidentales, páginas comerciales, ofertas laborales, documentación, soporte, foros no verificables, contenido SEO y artículos reciclados sin novedades. Deduplica por título, URL, dominio, contenido, empresas, evento, fecha y similitud semántica. Si varias fuentes cubren el mismo hecho, entrega un solo evento usando la fuente oficial o más confiable, reciente y completa. No repitas eventos ya informados y diferencia la fecha de publicación de la fecha del acontecimiento."""
+
 
 def db():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
@@ -69,6 +71,7 @@ AUDIT_ACTIONS={
     'user_item':'Gestión de usuario','scan':'Ejecución manual del monitoreo','read_alerts':'Lectura de alertas',
     'send_articles_mail':'Envío manual de noticias por correo',
 }
+AUDIT_ACTIONS['news_criteria']='Configuración de criterios de noticias'
 
 
 @app.before_request
@@ -122,6 +125,11 @@ def init_db():
         c.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS browser_search BOOLEAN NOT NULL DEFAULT FALSE")
         c.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS publication_date_filter BOOLEAN NOT NULL DEFAULT FALSE")
         c.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS publication_max_age_days INTEGER NOT NULL DEFAULT 7")
+        c.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS news_country TEXT NOT NULL DEFAULT 'Chile'")
+        c.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS news_period_hours INTEGER NOT NULL DEFAULT 24")
+        c.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS news_relevance_min INTEGER NOT NULL DEFAULT 70")
+        c.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS news_criteria TEXT NOT NULL DEFAULT ''")
+        c.execute("UPDATE settings SET news_criteria=%s WHERE news_criteria=''",(DEFAULT_NEWS_CRITERIA,))
         c.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS event_type TEXT NOT NULL DEFAULT 'monitoring'")
         c.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_source TEXT NOT NULL DEFAULT 'manual'")
         c.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS progress_current INTEGER NOT NULL DEFAULT 0")
@@ -256,6 +264,31 @@ def article_matches_keyword(article,keyword):
     return any(exact_phrase_in_text(keyword,article.get(field,'')) for field in ('title','summary'))
 
 
+def browser_article_relevance(article, keyword):
+    """Estimate direct relevance without requiring an AI provider."""
+    phrase=normalized_search_text(keyword)
+    title=normalized_search_text(article.get('title','')); summary=normalized_search_text(article.get('summary',''))
+    if not phrase: return 0
+    if exact_phrase_in_text(keyword,title): return 100
+    if exact_phrase_in_text(keyword,summary): return 85
+    terms=[term for term in phrase.split() if len(term)>2]
+    if not terms: return 0
+    title_coverage=sum(term in title.split() for term in terms)/len(terms)
+    summary_coverage=sum(term in summary.split() for term in terms)/len(terms)
+    return round(max(title_coverage*80,summary_coverage*70))
+
+
+EVENT_STOPWORDS={'de','del','la','las','el','los','en','un','una','y','o','para','por','con','que','se','su','sus','al','a'}
+
+
+def same_news_event(first_title, second_title):
+    """Detect near-identical headlines that describe the same event."""
+    first={x for x in article_title_key(first_title).split() if x not in EVENT_STOPWORDS and len(x)>2}
+    second={x for x in article_title_key(second_title).split() if x not in EVENT_STOPWORDS and len(x)>2}
+    if not first or not second: return False
+    return len(first & second)/len(first | second)>=0.60
+
+
 def keyword_search_query(keyword):
     """Quote only multiword terms when querying upstream search engines."""
     return f'"{keyword}"' if is_multiword_keyword(keyword) else keyword
@@ -290,11 +323,18 @@ def parse_publication_date(value):
     return parsed.astimezone(timezone.utc)
 
 
+def publication_is_recent(value, reference, max_age):
+    """Accept only plausible, known dates inside the configured period."""
+    published=parse_publication_date(value)
+    if published is None: return False
+    return datetime(1990,1,1,tzinfo=timezone.utc)<=published<=reference+timedelta(hours=6) and published>=reference-timedelta(**max_age)
+
+
 def select_publication_date(metadata, discovered_at):
-    """Apply metadata precedence and fall back to discovery time."""
+    """Apply metadata precedence, ignoring implausible future dates."""
     for source in ('datePublished','article:published_time','time','visible'):
         parsed=parse_publication_date((metadata or {}).get(source))
-        if parsed: return parsed,source
+        if parsed and datetime(1990,1,1,tzinfo=timezone.utc)<=parsed<=discovered_at+timedelta(hours=6): return parsed,source
     return discovered_at,'discovered_at'
 
 
@@ -633,6 +673,23 @@ def schedule_settings():
     return jsonify(ok=True)
 
 
+@app.route("/api/news-criteria", methods=["GET","PUT"])
+@permission_required('apis')
+def news_criteria():
+    if request.method=='GET':
+        return jsonify(setting=rows("SELECT news_country,news_period_hours,news_relevance_min,news_criteria FROM settings WHERE id=1")[0])
+    d=request.json or {}
+    country=str(d.get('news_country','')).strip(); criteria=str(d.get('news_criteria','')).strip()
+    try: period=int(d.get('news_period_hours',24)); relevance=int(d.get('news_relevance_min',70))
+    except (TypeError,ValueError): return jsonify(error="Período o relevancia no válidos"),400
+    if not country or len(country)>100: return jsonify(error="País no válido"),400
+    if not 1<=period<=8760: return jsonify(error="El período debe estar entre 1 y 8760 horas"),400
+    if not 0<=relevance<=100: return jsonify(error="La relevancia debe estar entre 0 y 100"),400
+    if not criteria or len(criteria)>6000: return jsonify(error="Los criterios son obligatorios y admiten hasta 6000 caracteres"),400
+    with db() as c: c.execute("UPDATE settings SET news_country=%s,news_period_hours=%s,news_relevance_min=%s,news_criteria=%s WHERE id=1",(country,period,relevance,criteria))
+    return jsonify(ok=True,message="Criterios de noticias guardados")
+
+
 @app.route("/api/mail-relay",methods=["GET","PUT"])
 @permission_required('relay')
 def mail_relay_settings():
@@ -788,11 +845,18 @@ def demo_articles(phrase):
     return [{"title":f"Nuevas tendencias sobre {phrase}","url":f"https://news.example.com/{slug}/{stamp}","source":"Monitor IA","published_at":datetime.now(timezone.utc).isoformat(),"summary":f"Resumen automático de las tendencias recientes relacionadas con {phrase}.","image_url":""}]
 
 
-def provider_articles(provider, phrase):
+def provider_articles(provider, phrase, news_setting=None):
     """Ask a configured model to search the web and return normalized JSON links."""
     search_instruction=(f'la frase exacta "{phrase}"; las palabras deben aparecer juntas y en ese orden'
                         if is_multiword_keyword(phrase) else f'la palabra "{phrase}"')
-    prompt=(f'Busca noticias recientes y verificables que contengan {search_instruction}. Devuelve únicamente JSON '
+    news_setting=news_setting or {}
+    country=str(news_setting.get('news_country') or 'Chile')
+    period=int(news_setting.get('news_period_hours') or 24)
+    relevance=int(news_setting.get('news_relevance_min') or 70)
+    criteria=str(news_setting.get('news_criteria') or DEFAULT_NEWS_CRITERIA)
+    prompt=(f'Busca noticias de {country} publicadas durante las últimas {period} horas que contengan {search_instruction}. '
+            f'Solo acepta resultados con relevancia >= {relevance}/100. Criterios editoriales: {criteria}\n'
+            'Devuelve cada evento una sola vez y únicamente JSON '
             'como una lista de hasta 10 objetos con title, summary, image_url, url, source y published_at. '
             'summary debe ser un resumen informativo de 2 a 3 frases e image_url la imagen principal real. No inventes enlaces.')
     headers={'Content-Type':'application/json'}
@@ -839,6 +903,7 @@ def smtp_connection(relay):
 def notification_message(relay,user,article):
     title=html.escape(article.get('title','Nuevo registro')); keyword=html.escape(article.get('keyword','')); source=html.escape(article.get('source','Autoweb')); url=article.get('url','')
     message=EmailMessage(); message['Subject']=f"Autoweb · Nuevo registro: {article.get('title','Noticia')}"[:200]
+    message['Date']=format_datetime(datetime.now(timezone.utc)); message['Message-ID']=make_msgid(domain=(relay['sender_email'].partition('@')[2] or None))
     message['From']=f"{relay['sender_name']} <{relay['sender_email']}>"; message['To']=user['email']
     if relay.get('admin_email') and relay['admin_email'].lower()!=user['email'].lower(): message['Bcc']=relay['admin_email']
     message.set_content(f"Hola {user['name']},\n\nEl sistema de seguimiento web detectó un nuevo registro.\n\n{article.get('title','')}\nTema: {article.get('keyword','')}\nFuente: {article.get('source','')}\nURL: {url}\n\nAutoweb")
@@ -914,10 +979,25 @@ def digest_notification_message(relay,user,articles):
         html_items.append(f"""<div style="border:1px solid #dfe8e4;border-radius:12px;padding:22px;margin:18px 0"><div style="font-size:11px;color:#71817d;text-transform:uppercase">Nuevo hallazgo</div><h2 style="font-size:20px;line-height:1.35">{html.escape(article.get('title','Nuevo registro'))}</h2><p><b>Parámetro:</b> {html.escape(article.get('keyword',''))}<br><b>Fuente:</b> {html.escape(article.get('source','Autoweb'))}</p><a href="{html.escape(url,quote=True)}" style="display:inline-block;background:#174d49;color:white;text-decoration:none;padding:12px 18px;border-radius:8px;font-weight:bold">Ver registro completo →</a></div>""")
     label='nuevo registro' if count==1 else 'nuevos registros'
     message=EmailMessage(); message['Subject']=f"Autoweb · {count} {label} detectados"
+    message['Date']=format_datetime(datetime.now(timezone.utc)); message['Message-ID']=make_msgid(domain=(relay['sender_email'].partition('@')[2] or None))
     message['From']=f"{relay['sender_name']} <{relay['sender_email']}>"; message['To']=user['email']
     if relay.get('admin_email') and relay['admin_email'].lower()!=user['email'].lower(): message['Bcc']=relay['admin_email']
     message.set_content(f"Hola {user['name']},\n\nEl sistema de seguimiento web detectó {count} {label}.\n\n"+'\n\n'.join(plain_items)+"\n\nAutoweb")
     message.add_alternative(f"""<!doctype html><html><body style="margin:0;background:#f3f6f4;font-family:Arial,sans-serif;color:#18302e"><div style="max-width:680px;margin:30px auto;background:white;border-radius:16px;overflow:hidden;border:1px solid #dfe8e4"><div style="background:#174d49;color:white;padding:28px 34px"><div style="font-size:22px;font-weight:bold">Autoweb</div><div style="color:#dcff7e;margin-top:6px">INTELIGENCIA QUE ANTICIPA</div></div><div style="padding:34px"><h1 style="font-size:25px;margin:0 0 14px">Hola {html.escape(user['name'])},</h1><p style="font-size:16px;line-height:1.6;color:#526562">El sistema de seguimiento web ha detectado <b>{count} {label}</b> relacionados con tus parámetros de monitoreo.</p>{''.join(html_items)}<p style="font-size:12px;color:#899693">Este mensaje fue enviado automáticamente por Autoweb.</p></div></div></body></html>""",subtype='html')
+    return message
+
+
+def no_news_notification_message(relay,user,setting):
+    """Build the status email sent after an automatic scan without new findings."""
+    frequency_labels={'daily':'diariamente','weekly':'semanalmente','monthly':'mensualmente'}
+    frequency=frequency_labels.get(setting.get('frequency'),'según la programación configurada')
+    configured_hour=str(setting.get('hour') or '09:00')[:5]
+    message=EmailMessage(); message['Subject']='Autoweb · Monitoreo automático sin nuevas noticias'
+    message['Date']=format_datetime(datetime.now(timezone.utc)); message['Message-ID']=make_msgid(domain=(relay['sender_email'].partition('@')[2] or None))
+    message['From']=f"{relay['sender_name']} <{relay['sender_email']}>"; message['To']=user['email']
+    if relay.get('admin_email') and relay['admin_email'].lower()!=user['email'].lower(): message['Bcc']=relay['admin_email']
+    message.set_content(f"Hola {user['name']},\n\nEl monitoreo automático finalizó correctamente y no detectó nuevas noticias.\n\nProgramación: {frequency} a las {configured_hour}.\n\nAutoweb")
+    message.add_alternative(f"""<!doctype html><html><body style="margin:0;background:#f3f6f4;font-family:Arial,sans-serif;color:#18302e"><div style="max-width:680px;margin:30px auto;background:white;border-radius:16px;overflow:hidden;border:1px solid #dfe8e4"><div style="background:#174d49;color:white;padding:28px 34px"><div style="font-size:22px;font-weight:bold">Autoweb</div><div style="color:#dcff7e;margin-top:6px">INTELIGENCIA QUE ANTICIPA</div></div><div style="padding:34px"><h1 style="font-size:25px;margin:0 0 14px">Hola {html.escape(user['name'])},</h1><p style="font-size:16px;line-height:1.6;color:#526562">El monitoreo automático finalizó correctamente.</p><div style="border:1px solid #dfe8e4;border-radius:12px;padding:24px;margin:24px 0;background:#f8faf9;text-align:center"><div style="font-size:34px;margin-bottom:10px">✓</div><h2 style="font-size:20px;margin:0 0 10px;color:#174d49">Sin nuevas noticias</h2><p style="margin:0;color:#526562;line-height:1.6">No se detectaron nuevos registros en esta ejecución.</p></div><div style="background:#eef5dc;border-radius:10px;padding:16px 20px"><b>Horario configurado</b><br><span style="color:#526562;text-transform:capitalize">{frequency} a las {html.escape(configured_hour)}</span></div><p style="font-size:12px;color:#899693;margin-top:26px">Este mensaje fue enviado automáticamente por Autoweb.</p></div></div></body></html>""",subtype='html')
     return message
 
 
@@ -943,15 +1023,34 @@ def notify_new_articles(articles):
     return sent,('; '.join(errors)[:500] if errors else None)
 
 
-def record_mail_run(run_source,article_count,sent,error,started_at=None):
+def notify_no_new_articles(setting):
+    relay=rows("SELECT * FROM mail_relay WHERE id=1")[0]
+    if not relay['enabled']: return 0,"Relay deshabilitado; no se envió el aviso sin novedades"
+    if not relay['smtp_host'] or not relay['sender_email']: return 0,"Relay habilitado sin servidor SMTP o remitente"
+    users=rows("SELECT name,email FROM users WHERE active=TRUE ORDER BY id")
+    if not users: return 0,"No existen usuarios activos para recibir notificaciones"
+    sent=0; errors=[]
+    for user in users:
+        try:
+            with smtp_connection(relay) as server:
+                refused=server.send_message(no_news_notification_message(relay,user,setting)) or {}
+            if user['email'] in refused: errors.append(f"{user['email']}: destinatario rechazado por SMTP")
+            else: sent+=1
+        except Exception as exc: errors.append(f"{user['email']}: {exc}")
+    return sent,('; '.join(errors)[:500] if errors else None)
+
+
+def record_mail_run(run_source,article_count,sent,error,started_at=None,no_news=False):
     """Add a visible delivery result to the monitoring log."""
-    if not article_count: return
+    if not article_count and not no_news: return
     started_at=started_at or datetime.now(timezone.utc)
     finished_at=datetime.now(timezone.utc)
     status='success' if sent and not error else 'error'
     source='automático' if run_source=='automatic' else 'manual'
-    if status=='success':
-        message=f'Envío {source} exitoso: {article_count} noticias enviadas a {sent} destinatarios'
+    if status=='success' and no_news:
+        message=f'Aviso automático sin novedades aceptado por SMTP para {sent} destinatarios'
+    elif status=='success':
+        message=f'Envío {source} aceptado por SMTP: {article_count} noticias para {sent} destinatarios'
     elif sent:
         message=f'Envío {source} parcial: {article_count} noticias enviadas a {sent} destinatarios · {error}'
     else:
@@ -963,7 +1062,7 @@ def record_mail_run(run_source,article_count,sent,error,started_at=None):
         """,(started_at,finished_at,status,article_count,sent,message[:500],run_source,article_count,article_count,'Correo enviado' if status=='success' else 'Error de correo',finished_at))
 
 
-def browser_results(engine, phrases, inspect_publication=False, progress_callback=None):
+def browser_results(engine, phrases, inspect_publication=False, progress_callback=None, country='Chile'):
     """Navigate a search engine with a headless browser and collect result links."""
     try:
         from selenium import webdriver
@@ -985,7 +1084,8 @@ def browser_results(engine, phrases, inspect_publication=False, progress_callbac
         for phrase in phrases:
             prefix,marker,suffix=str(engine['search_url']).partition('{query}')
             if not marker: raise ValueError("La URL del motor no contiene el marcador {query}")
-            search_url=validate_outbound_url(prefix+urllib.parse.quote_plus(keyword_search_query(phrase))+suffix,SEARCH_HOSTS)
+            localized_query=f"{keyword_search_query(phrase)} {country}".strip()
+            search_url=validate_outbound_url(prefix+urllib.parse.quote_plus(localized_query)+suffix,SEARCH_HOSTS)
             is_feed='rss' in search_url.lower() or 'format=rss' in search_url.lower()
             if is_feed:
                 try:
@@ -1026,7 +1126,8 @@ def browser_results(engine, phrases, inspect_publication=False, progress_callbac
                             const result={datePublished:'','article:published_time':'',time:'',visible:'',summary:'',image_url:''};
                             const visit=value=>{if(Array.isArray(value))value.forEach(visit);else if(value&&typeof value==='object'){if(!result.datePublished&&value.datePublished)result.datePublished=String(value.datePublished);if(!result.image_url&&value.image){const image=Array.isArray(value.image)?value.image[0]:value.image;result.image_url=typeof image==='string'?image:(image?.url||image?.contentUrl||'')}Object.values(value).forEach(visit)}};
                             document.querySelectorAll('script[type="application/ld+json"]').forEach(node=>{try{visit(JSON.parse(node.textContent))}catch(e){}});
-                            result['article:published_time']=document.querySelector('meta[property="article:published_time"]')?.content||'';
+                            result.datePublished=result.datePublished||document.querySelector('meta[itemprop="datePublished"],meta[name="date"],meta[name="pubdate"],meta[name="publish-date"]')?.content||'';
+                            result['article:published_time']=document.querySelector('meta[property="article:published_time"],meta[name="article:published_time"]')?.content||'';
                             result.time=document.querySelector('time[datetime]')?.getAttribute('datetime')||'';
                             const normalize=value=>(value||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLocaleLowerCase().replace(/\\s+/g,' ').trim();
                             const keyword=normalize(arguments[0]);
@@ -1046,7 +1147,10 @@ def browser_results(engine, phrases, inspect_publication=False, progress_callbac
                             result.visible=(text.match(/(?:Publicado|Publicada|Fecha de publicación)[^\n]{0,120}/i)||[])[0]||'';
                             return result;
                         """,phrase) or {}
+                        prior_published=parse_publication_date(article.get('published_at'))
                         published,date_source=select_publication_date(metadata,datetime.now(timezone.utc))
+                        if date_source=='discovered_at' and prior_published:
+                            published,date_source=prior_published,'feed'
                         article['published_at']=published.isoformat()
                         article['publication_date_source']=date_source
                         if metadata.get('summary'):
@@ -1093,7 +1197,7 @@ def run_scan(run_source='manual'):
                 def report_progress(phrase,step,stage,engine_offset=engine_index*len(kws)*11):
                     current=engine_offset+phrase_positions.get(phrase,0)*11+step
                     with db() as c: c.execute("UPDATE runs SET progress_current=%s,progress_stage=%s,heartbeat_at=%s WHERE id=%s",(min(current,progress_total),stage[:300],datetime.now(timezone.utc),run_id))
-                results=browser_results(engine,[k['phrase'] for k in kws],True,report_progress)
+                results=browser_results(engine,[k['phrase'] for k in kws],True,report_progress,setting['news_country'])
                 engine_stats.append(f"{engine['name']}: {sum(len(x) for x in results.values())}")
                 for phrase,items in results.items(): browser_found[phrase].extend(items)
             if not any(browser_found.values()):
@@ -1101,10 +1205,16 @@ def run_scan(run_source='manual'):
         else:
             progress_total=max(1,len(kws))
             with db() as c: c.execute("UPDATE runs SET progress_total=%s,progress_stage=%s,heartbeat_at=%s WHERE id=%s",(progress_total,'Preparando consultas',datetime.now(timezone.utc),run_id))
+        recent_titles=[x['title'] for x in rows("SELECT title FROM articles WHERE found_at >= %s",(datetime.now(timezone.utc)-timedelta(days=30),))]
         for keyword_index,k in enumerate(kws,start=1):
-            found=browser_found[k['phrase']] if browser_mode else (provider_articles(configured[0],k['phrase']) if configured else demo_articles(k['phrase']))
+            found=browser_found[k['phrase']] if browser_mode else (provider_articles(configured[0],k['phrase'],setting) if configured else demo_articles(k['phrase']))
             for a in found:
                 if not article_matches_keyword(a,k['phrase']): continue
+                if browser_mode and browser_article_relevance(a,k['phrase'])<setting['news_relevance_min']: continue
+                # Providers and browsers can return the same event with different
+                # URLs or slightly different headlines. Apply event deduplication
+                # uniformly before counting, storing or emailing the result.
+                if any(same_news_event(a.get('title',''),title) for title in recent_titles): continue
                 total+=1
                 canonical_url=canonical_article_url(a['url']); title_key=article_title_key(a['title'])
                 with db() as c:
@@ -1113,20 +1223,33 @@ def run_scan(run_source='manual'):
                         source=a.get('source') or (configured[0]['provider'] if configured else 'Monitor IA')
                         discovered_at=datetime.now(timezone.utc)
                         published_at=parse_publication_date(a.get('published_at'))
-                        filter_enabled=browser_mode and setting['publication_date_filter']
-                        should_alert=not filter_enabled or (published_at or discovered_at)>=discovered_at-timedelta(days=setting['publication_max_age_days'])
+                        date_known=a.get('publication_date_source')!='discovered_at' and published_at is not None
+                        if browser_mode and setting['publication_date_filter']:
+                            # A feed date can describe when the aggregator indexed
+                            # an item, not when the original article was published.
+                            verified_source=a.get('publication_date_source') in {'datePublished','article:published_time','time','visible'}
+                            if not date_known or not verified_source or not publication_is_recent(published_at,discovered_at,{'days':setting['publication_max_age_days']}):
+                                continue
+                        elif not browser_mode and not publication_is_recent(published_at,discovered_at,{'hours':setting['news_period_hours']}):
+                            continue
+                        should_alert=True
                         stored_published=(published_at or discovered_at).isoformat()
                         summary=report_fragment(a)
                         image_url=str(a.get('image_url') or '')[:2000]
                         c.execute("INSERT INTO articles(url,title,source,keyword,published_at,found_at,discovered_at,is_new,canonical_url,title_key,summary,image_url) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",(a['url'],a['title'],source,k['phrase'],stored_published,discovered_at,discovered_at,should_alert,canonical_url,title_key,summary,image_url))
+                        recent_titles.append(a['title'])
                         if should_alert:
                             new_count+=1
                             new_articles.append({'url':a['url'],'title':a['title'],'source':source,'keyword':k['phrase'],'summary':summary,'image_url':image_url,'published_at':stored_published})
             if not browser_mode:
                 with db() as c: c.execute("UPDATE runs SET progress_current=%s,progress_stage=%s,heartbeat_at=%s WHERE id=%s",(keyword_index,f"Tema completado: {k['phrase']}"[:300],datetime.now(timezone.utc),run_id))
         mail_started=datetime.now(timezone.utc)
-        mails_sent,mail_error=notify_new_articles(new_articles)
-        record_mail_run(run_source,len(new_articles),mails_sent,mail_error,mail_started)
+        no_news_notice=run_source=='automatic' and not new_articles
+        if no_news_notice:
+            mails_sent,mail_error=notify_no_new_articles(setting)
+        else:
+            mails_sent,mail_error=notify_new_articles(new_articles)
+        record_mail_run(run_source,len(new_articles),mails_sent,mail_error,mail_started,no_news_notice)
         finish=datetime.now(timezone.utc)
         frequency=setting['frequency']
         next_run=next_scheduled_run(finish,frequency,setting['hour'])
